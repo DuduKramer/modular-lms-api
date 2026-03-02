@@ -1,12 +1,14 @@
+import { error } from 'node:console';
 import { Api } from '../../core/utils/abstract.ts';
 import { RouteError } from '../../core/utils/route-error.ts';
 import { LmsQuery } from './query.ts';
 import { lmsTables } from './tables.ts';
+import { getCACertificates } from 'node:tls';
 
 export class LmsApi extends Api {
   query = new LmsQuery(this.db);
   handlers = {
-    postCourses: (req, res) => {
+    postCourse: (req, res) => {
       const { slug, title, description, lessons, hours } = req.body;
       const writeResult = this.query.insertCourse({
         slug,
@@ -26,7 +28,7 @@ export class LmsApi extends Api {
       });
     },
 
-    postLessons: (req, res) => {
+    postLesson: (req, res) => {
       const {
         courseSlug,
         slug,
@@ -37,16 +39,16 @@ export class LmsApi extends Api {
         order,
         free,
       } = req.body;
-      const writeResult = this.db
-        .query(
-          /*sql*/ `
-        INSERT OR IGNORE INTO "lessons"
-        ("course_id", "slug", "title", "seconds",
-        "video", "description", "order", "free")
-        VALUES((SELECT "id" FROM "courses" WHERE "slug" = ?),?,?,?,?,?,?,?)`,
-        )
-        .run(courseSlug, slug, title, seconds, video, description, order, free);
-      console.log(writeResult);
+      const writeResult = this.query.insertLesson({
+        courseSlug,
+        slug,
+        title,
+        seconds,
+        video,
+        description,
+        order,
+        free,
+      });
       if (writeResult.changes === 0) {
         throw new RouteError(400, 'erro ao criar aula');
       }
@@ -56,13 +58,141 @@ export class LmsApi extends Api {
         title: 'aula criada',
       });
     },
+
+    getCourses: (req, res) => {
+      const courses = this.query.selectCourses();
+      if (courses.length === 0) {
+        throw new RouteError(404, 'nenhum curso encontrado ');
+      }
+      res.status(200).json(courses);
+    },
+
+    getCourse: (req, res) => {
+      const { slug } = req.params;
+      const course = this.query.selectCourse(slug);
+      const lessons = this.query.selectLessons(slug);
+      if (!course) {
+        throw new RouteError(404, 'curso não encontrado');
+      }
+
+      const userId = 1;
+      let completed: {
+        lesson_id: number;
+        completed: string;
+      }[] = [];
+      if (userId) {
+        //verifica usuario logado
+        completed = this.query.selectLessonsCompleted(userId, course.id);
+      }
+      res.status(200).json({ course, lessons, completed });
+    },
+
+    getLesson: (req, res) => {
+      const { courseSlug, lessonSlug } = req.params;
+      const lesson = this.query.selectLesson(courseSlug, lessonSlug);
+      const nav = this.query.selectLessonNav(courseSlug, lessonSlug);
+      if (!lesson) {
+        throw new RouteError(404, 'aula não encontrada');
+      }
+      const i = nav.findIndex((l) => l.slug === lesson.slug);
+      const prev = i === 0 ? null : nav.at(i - 1)?.slug;
+      const next = nav.at(i + 1)?.slug ?? null;
+
+      const userId = 1;
+      let completed = '';
+      if (userId) {
+        //verifica usuario logado
+        const lessonCompleted = this.query.selectLessonCompleted(
+          userId,
+          lesson.id,
+        );
+        if (lessonCompleted) {
+          completed = lessonCompleted.completed;
+        }
+      }
+
+      res.status(200).json({ ...lesson, prev, next, completed });
+    },
+
+    completeLesson: (req, res) => {
+      const userId = 1;
+      const { courseId, lessonId } = req.body;
+
+      const writeResult = this.query.insertLessonCompleted(
+        userId,
+        courseId,
+        lessonId,
+      );
+      if (writeResult.changes === 0) {
+        throw new RouteError(400, 'erro ao completar aula');
+      }
+
+      const progress = this.query.SelectProgress(userId, courseId);
+      const incompleteLessons = progress.filter((item) => !item.completed);
+      if (progress.length > 0 && incompleteLessons.length === 0) {
+        console.log('Gerar Certificado');
+        const certificate = this.query.insertCertificate(userId, courseId);
+        if (!certificate) {
+          throw new RouteError(400, 'erro ao gerar certificado');
+        }
+        res.status(201).json({
+          certificate: certificate.id,
+          title: 'aula concluída',
+        });
+        return;
+      }
+      res.status(201).json({
+        certificate: null,
+        title: 'aula concluída',
+      });
+    },
+
+    resetCourse: (req, res) => {
+      const userId = 1;
+      const { courseId } = req.body;
+      const writeResult = this.query.deleteLessonsCompleted(userId, courseId);
+      if (writeResult.changes === 0) {
+        throw new RouteError(400, 'erro ao resetar curso');
+      }
+      res.status(200).json({
+        title: 'curso resetado',
+      });
+    },
+
+    getCertificates: (req, res) => {
+      const userId = 1;
+      const certificates = this.query.selectCertificates(userId);
+      if (certificates.length === 0) {
+        throw new RouteError(400, 'nenhum certificado encontrado');
+      }
+      res.status(200).json(certificates);
+    },
+
+    getCertificate: (req, res) => {
+      const { id } = req.params;
+      const certificate = this.query.selectCertificate(id);
+      if (!certificate) {
+        throw new RouteError(400, 'certficado não encontrado');
+      }
+      res.status(200).json(certificate);
+    },
   } satisfies Api['handlers'];
 
   tables(): void {
     this.db.exec(lmsTables);
   }
   routes(): void {
-    this.router.post('/lms/courses', this.handlers.postCourses);
-    this.router.post('/lms/lessons', this.handlers.postLessons);
+    this.router.post('/lms/course', this.handlers.postCourse);
+    this.router.get('/lms/courses', this.handlers.getCourses);
+    this.router.get('/lms/course/:slug', this.handlers.getCourse);
+    this.router.delete('/lms/course/reset', this.handlers.resetCourse);
+    this.router.post('/lms/lesson', this.handlers.postLesson);
+    this.router.get(
+      'lms/lesson/:courseSlug/:lessonSlug',
+      this.handlers.getLesson,
+    );
+    this.router.post('/lms/lesson/complete', this.handlers.completeLesson);
+    this.router.get('/lms/certificates', this.handlers.getCertificates);
+    this.router.get('/lms/certificate/:id', this.handlers.getCertificate);
   }
 }
